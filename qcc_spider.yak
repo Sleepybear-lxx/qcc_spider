@@ -1,0 +1,429 @@
+// TODO qcc爬虫，截止2023/04/14，反爬测试通过
+yakit.AutoInitYakit()
+yakit.EnableTable("股权信息", ["KeyNo","企业名称","占比"])
+yakit.EnableTable("备案信息", ["网站名称","网址","域名","备案号"])
+yakit.EnableTable("App信息", ["软件名称","软件描述"])
+yakit.EnableTable("基础信息", ["公司名称","KeyNo","官网","法人","邮箱","历史邮箱"])
+loglevel(`info`)
+
+
+// TODO 定义全局变量
+// seed字典及firm页面的正则规则，HTTP请求方法
+seeds_dic = {
+    "0": "W", 
+    "1": "l", 
+    "2": "k", 
+    "3": "B", 
+    "4": "Q", 
+    "5": "g", 
+    "6": "f", 
+    "7": "i", 
+    "8": "i", 
+    "9": "r", 
+    "10": "v", 
+    "11": "6", 
+    "12": "A", 
+    "13": "K", 
+    "14": "N", 
+    "15": "k", 
+    "16": "4", 
+    "17": "L", 
+    "18": "1", 
+    "19": "8"
+    }
+seeds_length = len(seeds_dic)
+website_re_rule=`"websitelist","count":(.*?),`
+app_re_rule=`"applist","count":(.*?),`
+equityinvestment_re_rule=`"touzilist","count":(.*?),`
+firm_page_re_rule_list=[website_re_rule,app_re_rule,equityinvestment_re_rule]
+POST="POST"
+GET="GET"
+
+
+// 对原始字符串进行替换
+seeds_generator = func(s) {
+    s=s.Lower()
+    s=s+s
+    res = ""
+    for i = 0; i < len(s); i++ {
+        res = res + seeds_dic[string(s[i] % seeds_length)]
+    }
+    return res    
+}
+
+
+// sha512哈希计算
+hash_generator=func(key,data){
+    res=codec.HmacSha512(key,data)
+    sub_res=``
+    for i in res{
+        sub_res=sub_res+"%02x" % i
+    }
+    return sub_res
+}
+
+
+// 计算哈希后的http请求头
+header_key_generator=func(url,data){
+    if data==""{
+        data="{}"
+    }
+    key=seeds_generator(url)
+    message=url.Lower()+data.Lower()
+    hash_res=hash_generator(key,message)
+    return hash_res.Lower()[8:28]
+}
+
+
+// 计算与 哈希后的http请求头 对应的哈希值
+header_value_generator=func(url,data,tid){
+    if data==""{
+        data="{}"
+    }
+    key=seeds_generator(url)
+    message=url.Lower()+"pathString"+data.Lower()+tid
+    hash_res=hash_generator(key,message)
+    return hash_res.Lower()
+}
+
+
+// 请求qcc主页，返回正则匹配的pid和tid
+get_pid_and_tid=func(cookie){
+    packet=`GET / HTTP/2
+Host: www.qcc.com
+Cookie: {{params(cookie)}}
+User-Agent: 
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8
+Accept-Language: zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2
+Accept-Encoding: gzip, deflate
+Upgrade-Insecure-Requests: 1
+Sec-Fetch-Dest: document
+Sec-Fetch-Mode: navigate
+Sec-Fetch-Site: none
+Sec-Fetch-User: ?1
+Te: trailers`
+
+    rsp,req,err=poc.HTTP(packet, poc.https(true),poc.params({"cookie":cookie}))
+    if err != nil {
+        die(err)
+    }
+    if str.MatchAllOfSubString(rsp, `消息中心`){
+        // yakit.Info("本次模拟登录成功")
+    }else{
+        yakit.Warn(`本次模拟登录失败，请检查cookie是否正确`)
+        os.Exit(0)
+    }
+    get_id_re_rule=`<script>window.pid='(.*?)'; window.tid='(.*?)'</script>`
+    re_res=re.FindSubmatch(rsp, get_id_re_rule)
+    pid=re_res[1]
+    tid=re_res[2]
+    // dump(pid,tid)
+    return pid,tid
+}
+
+
+// 获得pid，tid，哈希后的http请求头及对应参数值
+get_id_and_hash_res=func(cookie,url,data,name){
+    pid,tid=get_pid_and_tid(cookie)
+    if pid&&tid{
+        // yakit.Info(f`匹配到pid为${pid},匹配到tid为${tid}`)
+    }else{
+        yakit.Error(`获取pid或uid失败，脚本即将退出`)
+        os.Exit(0)
+    }  
+    header_key=header_key_generator(url,data)
+    yakit.Info(f"计算请求${name}的header_key为${header_key}")
+    header_value=header_value_generator(url,data,tid)
+    yakit.Info(f"计算请求${name}的header_value为${header_value}")
+    return pid,tid,header_key,header_value
+}
+
+
+// 核心函数，向对应接口发起查询请求，获得json格式数据响应
+qcc_core_func=func(url,cookie,pid,header_key,header_value,data,method){
+    packet=`{{params(method)}} {{params(url)}} HTTP/2
+Host: www.qcc.com
+User-Agent: 
+Accept-Encoding: gzip, deflate
+Accept: application/json, text/plain, */*
+Accept-Language: zh-CN,zh;q=0.9
+Content-Length: 73
+Content-Type: application/json
+Cookie: {{params(cookie)}}
+Origin: https://www.qcc.com
+Referer: https://www.qcc.com/web/search/advance?hasState=true
+Sec-Fetch-Dest: empty
+Sec-Fetch-Mode: cors
+Sec-Fetch-Site: same-origin
+X-Requested-With: XMLHttpRequest
+X-Pid: {{params(pid)}}
+{{params(header_key)}}: {{params(header_value)}}
+
+{{params(data)}}`
+
+    rsp,req,err=poc.HTTP(packet, poc.params({"url":url,"cookie":cookie,"pid":pid,"header_key":header_key,"header_value":header_value,"data":data,"method":method}),poc.https(true))
+    if err != nil { die(err) }
+    header,body=poc.Split(rsp)
+    if str.MatchAllOfSubString(body,"未满足前提条件"){
+        yakit.Warn("您的操作过于频繁，请登录网站验证后再操作")
+        yakit.Info(f"当前爬取时间间隔为${time_interval}，建议解除限制后设置更大的爬取时间间隔")
+        os.Exit(0)        
+    }
+    return body
+}
+
+
+// 请求基础信息，生成的key_no用于后续查询的参数
+get_base_res=func(cookie,url,data,name){
+    pid,tid,header_key,header_value=get_id_and_hash_res(cookie,url,data,name)
+    qcc_base_res=qcc_core_func(url,cookie,pid,header_key,header_value,data,POST)
+    return qcc_base_res_parse(qcc_base_res)
+}
+
+
+// 请求firm页面，返回的num作为是否后续具体查询的判断条件
+get_firm=func(keyno,cookie){
+    packet=`GET /firm/{{params(keyno)}}.html HTTP/2
+Host: www.qcc.com
+Cookie: {{params(cookie)}}
+User-Agent: 
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8
+Accept-Language: zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2
+Accept-Encoding: gzip, deflate
+Referer: https://www.qcc.com/web/search?key=%E6%B7%98%E5%AE%9D
+Upgrade-Insecure-Requests: 1
+Sec-Fetch-Dest: document
+Sec-Fetch-Mode: navigate
+Sec-Fetch-Site: same-origin
+Sec-Fetch-User: ?1
+Te: trailers`
+
+    rsp,req,err=poc.HTTP(packet, poc.params({"keyno":keyno,"cookie":cookie}),poc.https(true))
+    if err != nil {
+        die(err)
+    }
+    website_num=0
+    app_num=0
+    equityinvestment_num=0
+    if str.MatchAllOfSubString(rsp, `<title>用户验证 - 企查查</title>`){
+        yakit.Warn("账号使用异常，已限制继续访问。可使用 企查查APP 或微信，扫码解除限制")
+        yakit.Info(f"当前爬取时间间隔为${time_interval}，建议解除限制后设置更大的爬取时间间隔")
+        os.Exit(0)
+    }
+    if str.MatchAllOfRegexp(rsp, firm_page_re_rule_list...){
+        website_num=re.FindSubmatch(rsp, website_re_rule)[1]
+        app_num=re.FindSubmatch(rsp, app_re_rule)[1]
+        equityinvestment_num=re.FindSubmatch(rsp,equityinvestment_re_rule)[1]
+        yakit.Info(f"开始匹配/firm/${keyno}结果信息")        
+        yakit.Info(f"匹配到该企业App数量为%s,备案网站数量为%s,对外投资数量为%s" % [app_num,website_num,equityinvestment_num])
+    }else{
+        yakit.Error("get_firm正则匹配失败,脚本即将退出")
+        os.Exit(0)
+    }
+    return website_num,app_num,equityinvestment_num
+}
+
+
+// 设置不同参数，调用核心函数，查询相对应的数据
+get_required_res=func(key_no_dic,key_no,dic_key_name,tips_info,time_interval,url,data,name,cookie,specific_dic,method){
+    if key_no_dic[key_no][dic_key_name]=="0"{
+        yakit.Warn(f"key_no为%s的企业%s数量为0" %[key_no,tips_info])
+    }else{
+        time.sleep(time_interval)
+        pid,tid,header_key,header_value=get_id_and_hash_res(cookie,url,data,name)
+        qcc_res=qcc_core_func(url,cookie,pid,header_key,header_value,data,method)
+        return qcc_res
+    }
+}
+
+
+// 解析qcc base信息
+qcc_base_res_parse=func(qcc_res){
+    qcc_res_json=json.loads(qcc_res)
+    qcc_res_status=qcc_res_json["Status"]
+    qcc_res_result=qcc_res_json["Result"]
+    if qcc_res_status!=200{
+        yakit.Error(f`查询结果错误，响应json数据中Status为${qcc_res_status}，脚本即将退出`)
+        os.Exit(0)
+    }
+    yakit.Info(`基础信息查询结果返回，开始解析...`)
+    data_json=qcc_res_json
+    qcc_res_result=data_json["Result"]
+    key_no_list=[]
+    for sub_res in qcc_res_result{
+        // println(sub_res["KeyNo"])
+        // println(sub_res["Name"])
+        // println(sub_res["OperName"])
+        // println(sub_res["Email"])
+        // println(sub_res["GW"])
+        // println(sub_res["EmailList"]) 
+        email_history_res=sub_res["EmailList"]
+        email_history_text=""
+        for sub_email_history_res in email_history_res{
+            email_history_text=email_history_text+"\n"+"%s    %s年报" %[sub_email_history_res["e"],sub_email_history_res["s"]]
+        }
+        data=make(map[string]var)
+        data["公司名称"]=sub_res["Name"].ReplaceAll("<em>", "").ReplaceAll("</em>", "")
+        data["KeyNo"]=sub_res["KeyNo"]
+        data["官网"]=sub_res["GW"]
+        data["法人"]=sub_res["OperName"]
+        data["邮箱"]=sub_res["Email"]
+        data["历史邮箱"]=email_history_text
+        yakit.Output(yakit.TableData("基础信息",data))
+        key_no_list.Append(sub_res["KeyNo"])
+        // TODO 仅仅记录第一条数据，当确定keyno调试时，可以取消此注释
+        break
+    }
+    // println(key_no_list)
+    return key_no_list
+}
+
+
+// 解析qcc app信息
+qcc_app_res_parse=func(qcc_res,app_dic,key_no){
+    if qcc_res ==nil{
+        return
+    }
+    yakit.Info(`App信息查询结果返回，开始解析...`)
+    qcc_res_json=json.loads(qcc_res)
+    // println(qcc_res_json)
+    qcc_res_page_info=qcc_res_json["pageInfo"]
+    qcc_app_res_total=qcc_res_page_info["total"]
+    data=qcc_res_json["data"]
+    for sub_data in data{
+        // println(sub_data["AppName"])
+        // println(sub_data["Description"])
+        // app_dic.Set(key_no,app_dic[key_no].Append({"Appname":sub_data["AppName"],"Description":sub_data["Description"]}))
+        data=make(map[string]var)
+        data["软件名称"]=sub_data["AppName"]
+        data["软件描述"]=sub_data["Description"]
+        yakit.Output(yakit.TableData("App信息",data))        
+        app_dic[key_no]=app_dic[key_no]+[{"Appname":sub_data["AppName"],"Description":sub_data["Description"]}]
+    }
+}
+
+
+// 解析qcc 备案网站信息
+qcc_website_res_parse=func(qcc_res,website_dic,key_no){
+    if qcc_res==nil{
+        return
+    }
+    qcc_res_json=json.loads(qcc_res)
+    // println(qcc_res_json)
+    yakit.Info(`备案网站信息查询结果返回，开始解析...`)
+    qcc_res_page_info=qcc_res_json["pageInfo"]
+    qcc_website_res_total=qcc_res_page_info["total"]
+    data=qcc_res_json["data"]
+    for sub_data in data{
+        // println(sub_data["AppName"])
+        // println(sub_data["Description"])
+        // app_dic.Set(key_no,app_dic[key_no].Append({"Appname":sub_data["AppName"],"Description":sub_data["Description"]}))
+        data=make(map[string]var)
+        data["网站名称"]=sub_data["WebsiteName"]
+        data["网址"]=sub_data["HomeAddress"]
+        data["域名"]=sub_data["DomainName"]
+        data["备案号"]=sub_data["WebRecordNo"]
+        yakit.Output(yakit.TableData("备案信息",data))        
+        website_dic[key_no]=website_dic[key_no]+[{"WebsiteName":sub_data["WebsiteName"],"HomeAddress":sub_data["HomeAddress"],"DomainName":sub_data["DomainName"],"WebRecordNo":sub_data["WebRecordNo"]}]
+    }
+    // println(website_dic)
+}
+
+
+// 解析qcc 股权信息
+qcc_equityinvestment_res_parse=func(qcc_res,equityinvestment_dic,key_no){
+    if qcc_res==nil{
+        return
+    }
+    qcc_res_json=json.loads(qcc_res)
+    // println(qcc_res_json)
+    yakit.Info(`股权信息查询结果返回，开始解析...`)
+    qcc_res_result=qcc_res_json["Result"]
+    qcc_equityinvestment_res_total=qcc_res_result["DetailCount"]
+    data=qcc_res_result["EquityShareDetail"]
+    for sub_data in data{
+        // println(sub_data["AppName"])
+        // println(sub_data["Description"])
+        // app_dic.Set(key_no,app_dic[key_no].Append({"Appname":sub_data["AppName"],"Description":sub_data["Description"]}))
+        data=make(map[string]var)
+        data["KeyNo"]=sub_data["KeyNo"]        
+        data["企业名称"]=sub_data["Name"]
+        data["占比"]=sub_data["Percent"]
+        yakit.Output(yakit.TableData("股权信息",data))
+        equityinvestment_dic[key_no]=equityinvestment_dic[key_no]+[{"Name":sub_data["Name"],"KeyNo":sub_data["KeyNo"],"Percent":sub_data["Percent"],}]
+    }
+    println(equityinvestment_dic)
+}
+
+
+main=func(){
+    yakit.Info("插件开始执行")
+
+    // TODO 爬取基础信息
+    // 基础信息包含了公司名，法人，邮箱，官网，可以通过返回的key_no字段拼接url
+    // 如https://www.qcc.com/firm/key_no.html直接浏览器查看具体信息
+    base_url = "/api/search/searchMulti"
+    base_data=`{"searchKey":"%s","pageIndex":%s,"pageSize":20}` % [keyword,pageIndex]
+    base_name="基础信息"       
+    key_no_list=get_base_res(cookie,base_url,base_data,base_name)
+    println(key_no_list)
+    time.sleep(5*time_interval)
+
+
+    // TODO 爬取firm页面
+    // get_firm函数访问https://www.qcc.com/firm/key_no.html，页面中含有企业对外投资数量，App数量及备案网站数量，当对应数量为0时，后续不再请求具体信息
+    key_no_dic={}
+    equityinvestment_dic={}  
+    website_dic={}
+    app_dic={}  
+    for key_no in key_no_list{
+        // TODO 针对key_no 调试时，取消该注释
+        // if key_no!="721b41d370eba30d707dbc517cec3b5e"{
+        //     continue
+        // }
+        website_num,app_num,equityinvestment_num=get_firm(key_no,cookie)
+        key_no_dic.Set(key_no,{"key_no":key_no,"website_num":website_num,"app_num":app_num,"equityinvestment_num":equityinvestment_num})
+
+
+        // TODO 爬取APP信息
+        // App信息包含了企业的App软件名称和软件描述
+        app_dic.Set(key_no,[])
+        qcc_app_res=get_required_res(key_no_dic,key_no,"app_num"/*对应于key_no_dic字典中的键名*/,"App",time_interval,f"/api/datalist/applist?keyNo=${key_no}"/*数据接口地址*/,""/*请求体*/,"App信息",cookie,app_dic,GET)
+        qcc_app_res_parse(qcc_app_res,app_dic,key_no)  
+
+
+        // TODO 爬取备案信息
+        // 备案信息包含了企业的网站名称、网址、域名和网站备案号
+        website_dic.Set(key_no,[])
+        website_num=key_no_dic[key_no]["website_num"]
+        pagesize=10
+        pageindex=(int(website_num)+pagesize-1)/pagesize
+        for index=1;index<=pageindex;index++{
+            qcc_website_res=get_required_res(key_no_dic,key_no,"website_num"/*对应于key_no_dic字典中的键名*/,"备案网站",time_interval,f"/api/datalist/websitelist"/*数据接口地址*/,`{"keyNo":"%s","pageIndex":%s,"isValid":1}` %[key_no,string(index)]/*请求体*/,"备案信息",cookie,website_dic,POST)
+            qcc_website_res_parse(qcc_website_res,website_dic,key_no)
+        }
+
+
+        // TODO 爬取股权信息
+        // 股权信息包含了持股的企业名称、百分比例及key_no
+        equityinvestment_dic.Set(key_no,[])
+        qcc_equityinvestment_res=get_required_res(key_no_dic,key_no,"equityinvestment_num"/*对应于key_no_dic字典中的键名*/,"对外投资",time_interval,"/api/charts/getEquityInvestment"/*数据接口地址*/,`{"keyNo":"%s"}` % [key_no]/*请求体*/,"股权信息",cookie,equityinvestment_dic,POST)
+        qcc_equityinvestment_res_parse(qcc_equityinvestment_res,equityinvestment_dic,key_no)
+    }
+    println(key_no_dic)
+    // println(equityinvestment_dic)
+    // println(app_dic)
+    yakit.Info("插件执行结束")
+}
+
+
+// TODO 定义接收参数
+cookie=cli.String("cookie")
+pageIndex=cli.String("pageIndex", cli.setDefault(`1`))
+// 建议keyword输入完整的企业名称，提高爬取的针对性
+keyword=cli.String("keyword")
+// TODO 设置爬取时间间隔
+time_interval=cli.Float("time_interval", cli.setDefault("2"))
+
+
+main()
